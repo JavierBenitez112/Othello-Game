@@ -12,13 +12,15 @@ from client.features import NUM_FEATURES
 
 class OthelloMLP(nn.Module):
     """
-    MLP: 17 → Linear(64) → ReLU → Linear(32) → ReLU → Linear(1) → Tanh
+    MLP: 17 → 128 → 64 → 32 → 1  (más capacidad para aprender estrategia)
     """
 
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(NUM_FEATURES, 64),
+            nn.Linear(NUM_FEATURES, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),

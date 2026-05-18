@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 import torch.optim as optim
 from client.network import OthelloMLP
-from training.self_play import play_game, play_evaluation_games
+from training.self_play import play_games_parallel, play_evaluation_games
 from training.td_train import train_step
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -32,11 +32,13 @@ def run_phase(
     lr: float,
     eval_every: int,
     eval_games: int,
-    promote_threshold: float,
     phase_name: str,
+    n_epochs: int = 5,
 ) -> None:
     """
     Corre N iteraciones de self-play + entrenamiento + evaluación.
+    El champion siempre se actualiza con el challenger entrenado.
+    El win_rate se usa solo para monitoreo.
     """
     for i in range(n_iterations):
         t0 = time.time()
@@ -47,33 +49,38 @@ def run_phase(
         challenger.eval()
         optimizer = optim.Adam(challenger.parameters(), lr=lr)
 
-        # Generate games with champion vs champion
-        trajectories = []
-        for _ in range(games_per_iter):
-            traj = play_game(champion, champion, search_depth=search_depth, temperature=temperature)
-            trajectories.append(traj)
+        # Generate games with champion vs champion (en paralelo)
+        trajectories = play_games_parallel(
+            champion, games_per_iter, search_depth, temperature
+        )
 
-        # Train challenger on champion's games
-        loss = train_step(challenger, optimizer, trajectories, lam=lam)
+        # Train challenger on champion's games (n_epochs épocas)
+        loss = train_step(challenger, optimizer, trajectories, lam=lam, n_epochs=n_epochs)
 
         elapsed = time.time() - t0
 
         if (i + 1) % eval_every == 0:
-            win_rate = play_evaluation_games(champion, challenger, eval_games)
+            # Evaluar ANTES de promover: champion (viejo) vs challenger (entrenado)
+            # Usar depth=2 para que la evaluación sea rápida (~2 min)
+            win_rate = play_evaluation_games(
+                champion, challenger, n_games=eval_games, search_depth=2
+            )
             logger.info(
                 "%s iter %d/%d: loss=%.4f, win_rate=%.3f, t=%.1fs",
                 phase_name, i + 1, n_iterations, loss, win_rate, elapsed
             )
-            if win_rate > promote_threshold:
-                champion.load_state_dict(challenger.state_dict())
-                champion.eval()
-                logger.info("  → Challenger promoted (win_rate=%.3f)", win_rate)
+            # Promover siempre — el modelo siempre evoluciona
+            champion.load_state_dict(challenger.state_dict())
+            champion.eval()
             champion.save(CHECKPOINTS_DIR / f"{phase_name}_champion.pt")
         else:
             logger.info(
                 "%s iter %d/%d: loss=%.4f, t=%.1fs",
                 phase_name, i + 1, n_iterations, loss, elapsed
             )
+            # Promover en iteraciones sin evaluación también
+            champion.load_state_dict(challenger.state_dict())
+            champion.eval()
 
 
 def main():
@@ -85,53 +92,51 @@ def main():
     champion = OthelloMLP().to(device)
     champion.eval()
 
-    logger.info("=== FASE 1: Bootstrap (2,000 partidas, depth=2) ===")
+    # Fase 1: Bootstrap rápido — exploración amplia a baja profundidad
+    logger.info("=== FASE 1: Bootstrap (depth=2, 150 partidas) ===")
     run_phase(
-        champion=champion,
-        device=device,
-        n_iterations=10,
-        games_per_iter=200,
-        search_depth=2,
-        temperature=1.5,
-        lam=0.7,
-        lr=0.001,
-        eval_every=5,
-        eval_games=100,
-        promote_threshold=0.52,
-        phase_name="Fase1",
+        champion=champion, device=device,
+        n_iterations=10, games_per_iter=150,
+        search_depth=2, temperature=1.5,
+        lam=0.7, lr=0.001,
+        eval_every=5, eval_games=40,
+        phase_name="Fase1", n_epochs=3,
     )
     champion.save(CHECKPOINTS_DIR / "phase1_final.pt")
 
-    logger.info("=== FASE 2 Early: self-play (depth=4) ===")
+    # Fase 2a: Profundidad moderada — el modelo empieza a ver táctica
+    logger.info("=== FASE 2 Early: self-play (depth=3, 150 partidas) ===")
     run_phase(
-        champion=champion, device=device, n_iterations=20, games_per_iter=300,
-        search_depth=4, temperature=1.0, lam=0.7, lr=0.001,
-        eval_every=5, eval_games=150, promote_threshold=0.55,
-        phase_name="Fase2Early",
+        champion=champion, device=device,
+        n_iterations=15, games_per_iter=150,
+        search_depth=3, temperature=1.0,
+        lam=0.7, lr=0.001,
+        eval_every=5, eval_games=40,
+        phase_name="Fase2Early", n_epochs=3,
     )
+    champion.save(CHECKPOINTS_DIR / "phase2early_final.pt")
 
-    logger.info("=== FASE 2 Mid: self-play (depth=5) ===")
+    # Fase 2b: Más profundidad — aprender estrategia de medio juego
+    logger.info("=== FASE 2 Mid: self-play (depth=4, 120 partidas) ===")
     run_phase(
-        champion=champion, device=device, n_iterations=30, games_per_iter=400,
-        search_depth=5, temperature=0.7, lam=0.7, lr=0.0005,
-        eval_every=5, eval_games=150, promote_threshold=0.55,
-        phase_name="Fase2Mid",
+        champion=champion, device=device,
+        n_iterations=12, games_per_iter=120,
+        search_depth=4, temperature=0.7,
+        lam=0.7, lr=0.0005,
+        eval_every=4, eval_games=40,
+        phase_name="Fase2Mid", n_epochs=3,
     )
+    champion.save(CHECKPOINTS_DIR / "phase2mid_final.pt")
 
-    logger.info("=== FASE 2 Late: self-play (depth=6) ===")
+    # Fase 3: Refinamiento fino — temperatura baja, aprender endgame
+    logger.info("=== FASE 3: Refinamiento (depth=5, λ=0.8) ===")
     run_phase(
-        champion=champion, device=device, n_iterations=30, games_per_iter=500,
-        search_depth=6, temperature=0.5, lam=0.7, lr=0.0002,
-        eval_every=5, eval_games=200, promote_threshold=0.55,
-        phase_name="Fase2Late",
-    )
-
-    logger.info("=== FASE 3: Refinamiento (depth=7, λ=0.8) ===")
-    run_phase(
-        champion=champion, device=device, n_iterations=20, games_per_iter=400,
-        search_depth=7, temperature=0.3, lam=0.8, lr=0.0001,
-        eval_every=5, eval_games=200, promote_threshold=0.55,
-        phase_name="Fase3",
+        champion=champion, device=device,
+        n_iterations=10, games_per_iter=100,
+        search_depth=5, temperature=0.3,
+        lam=0.8, lr=0.0002,
+        eval_every=5, eval_games=40,
+        phase_name="Fase3", n_epochs=3,
     )
 
     champion.save(MODEL_OUTPUT)
