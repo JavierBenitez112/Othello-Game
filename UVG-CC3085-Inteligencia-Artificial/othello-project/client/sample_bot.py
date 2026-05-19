@@ -208,12 +208,14 @@ def _choose_move_impl(board, color: str, legal_moves_list: list[str]) -> str:
     return best_move if best_move in legal_moves_list else legal_moves_list[0]
 
 
-def choose_move(board: list[list[str]], color: str, legal_moves: list[str]) -> str:
+def choose_move(board: list[list[str]], color: str, legal_moves: list[str], budget_seconds: float = 2.0) -> str:
     if not legal_moves:
         return "pass"
+    if len(legal_moves) == 1:
+        return legal_moves[0]
     if _MODEL is None:
         return random.choice(legal_moves)
-    return _ml_best_move(board, color, legal_moves, _MODEL, budget_seconds=2.8)
+    return _ml_best_move(board, color, legal_moves, _MODEL, budget_seconds=budget_seconds)
 
 
 def main() -> None:

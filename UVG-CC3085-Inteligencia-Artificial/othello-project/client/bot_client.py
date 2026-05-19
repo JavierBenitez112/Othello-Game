@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib import error, request
@@ -12,7 +14,7 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
-ChooseMove = Callable[[list[list[str]], str, list[str]], str | Awaitable[str]]
+ChooseMove = Callable[..., str | Awaitable[str]]
 
 
 class BotClient:
@@ -54,10 +56,12 @@ class BotClient:
             message_type = payload.get("type")
 
             if message_type == "your_turn":
+                t0 = time.time()
                 move = await self._choose_move(
                     payload["board"],
                     payload["color"],
                     payload["legal_moves"],
+                    t0,
                 )
                 await websocket.send(
                     json.dumps(
@@ -87,8 +91,11 @@ class BotClient:
             else:
                 logger.info("Received message: %s", payload)
 
-    async def _choose_move(self, board: list[list[str]], color: str, legal_moves: list[str]) -> str:
-        result = self.choose_move(board, color, legal_moves)
+    async def _choose_move(self, board: list[list[str]], color: str, legal_moves: list[str], t0: float) -> str:
+        # Leave 300ms for the send round-trip; clamp to at least 500ms so the bot always gets some think time.
+        budget = max(0.3, 1.8 - (time.time() - t0))
+        fn = functools.partial(self.choose_move, board, color, legal_moves, budget_seconds=budget)
+        result = await asyncio.to_thread(fn)
         if asyncio.iscoroutine(result):
             return await result
         return result
